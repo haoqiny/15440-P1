@@ -38,7 +38,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-	fmt.Println(params)
+	
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -106,7 +106,7 @@ func (c *client) Read() ([]byte, error) {
 func (c *client) Write(payload []byte) error {
 	SWmax := c.SWmin + c.params.WindowSize - 1
 	if c.SeqNum < c.SWmin || c.SeqNum > SWmax { //seqNum not in window
-		fmt.Println("seqNum not in window!")
+		fmt.Printf("SeqNum: %d, SWmin: %d, seqNum not in window!\n", c.SeqNum, c.SWmin)
 		return nil
 	}
 	// prepare send data
@@ -116,8 +116,8 @@ func (c *client) Write(payload []byte) error {
 	data, err := json.Marshal(msg)
 	if err == nil {
 		c.conn.Write(data)
-		c.SeqNum += 1
 		c.UnackedMap[c.SeqNum] = msg
+		c.SeqNum += 1
 	}
 	return nil
 }
@@ -142,8 +142,6 @@ func readRoutine(cli *client) {
 		if err != nil {
 			return
 		}
-
-		fmt.Println(&msg)
 		cli.receiveChan <- &msg
 	}
 }
@@ -196,10 +194,11 @@ func handleRequest(cli *client, msg *Message) {
 			fmt.Println("error occured, acking a nil message")
 			return
 		}
-		cli.UnackedMap[ackSeqNum] = nil
-		for cli.SWmin < cli.SeqNum {
+		delete(cli.UnackedMap, ackSeqNum)
+		for {
 			_, ok := cli.UnackedMap[cli.SWmin]
-			if !ok { //has been acked
+			if !ok && cli.SWmin < cli.SeqNum { //has been acked
+				//fmt.Printf("SWmin: %d -> %d\n", cli.SWmin, cli.SWmin+1)
 				cli.SWmin += 1
 			} else {
 				break
@@ -210,13 +209,13 @@ func handleRequest(cli *client, msg *Message) {
 	case MsgCAck: // if msg is CAck
 		cackSeqNum := msg.SeqNum
 		for i := 1; i <= cackSeqNum; i++ {
-			if cli.UnackedMap[cackSeqNum] != nil {
-				cli.UnackedMap[cackSeqNum] = nil
+			if cli.UnackedMap[i] != nil {
+				delete(cli.UnackedMap, i)
 			}
 		}
 		for cli.SWmin < cli.SeqNum {
 			_, ok := cli.UnackedMap[cli.SWmin]
-			if !ok { //has been acked
+			if !ok && cli.SWmin < cli.SeqNum { //has been acked
 				cli.SWmin += 1
 			} else {
 				break
