@@ -4,6 +4,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"fmt"
 
 	lspnet "github.com/cmu440/lspnet"
 )
@@ -17,7 +18,10 @@ type client struct {
 	conn        *lspnet.UDPConn  // UDP connection
 	SeqNum      int              // client side SN
 	mapHead     int              // the SN we are looking for next
+	SWmin       int              // the min index of the sliding window
 	MsgMap      map[int]*Message // map for storing all (possible out-of-order) incoming data
+	UnackedMap  map[int]*Message // map for storing unacked messages
+	params      *Params
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -34,6 +38,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
+	fmt.Println(params)
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -74,7 +79,10 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		conn:        udpConn,
 		SeqNum:      initialSeqNum + 1,
 		mapHead:     initialSeqNum + 1,
+		SWmin:       initialSeqNum + 1,
 		MsgMap:      make(map[int]*Message),
+		UnackedMap:  make(map[int]*Message),
+		params:      params,
 	}
 
 	go readRoutine(cli)
@@ -96,6 +104,11 @@ func (c *client) Read() ([]byte, error) {
 
 // Write() generates the new data msg and put into sendChan
 func (c *client) Write(payload []byte) error {
+	SWmax := c.SWmin + c.params.WindowSize - 1
+	if c.SeqNum < c.SWmin || c.SeqNum > SWmax { //seqNum not in window
+		fmt.Println("seqNum not in window!")
+		return nil
+	}
 	// prepare send data
 	checksum := CalculateChecksum(c.connId, c.SeqNum, len(payload), payload)
 	msg := NewData(c.connId, c.SeqNum, len(payload), payload, checksum)
@@ -104,6 +117,7 @@ func (c *client) Write(payload []byte) error {
 	if err == nil {
 		c.conn.Write(data)
 		c.SeqNum += 1
+		c.UnackedMap[c.SeqNum] = msg
 	}
 	return nil
 }
@@ -129,6 +143,7 @@ func readRoutine(cli *client) {
 			return
 		}
 
+		fmt.Println(&msg)
 		cli.receiveChan <- &msg
 	}
 }
@@ -176,9 +191,37 @@ func handleRequest(cli *client, msg *Message) {
 		}
 
 	case MsgAck: // if msg is Ack
+		ackSeqNum := msg.SeqNum
+		if cli.UnackedMap[ackSeqNum] == nil {
+			fmt.Println("error occured, acking a nil message")
+			return
+		}
+		cli.UnackedMap[ackSeqNum] = nil
+		for cli.SWmin < cli.SeqNum {
+			_, ok := cli.UnackedMap[cli.SWmin]
+			if !ok { //has been acked
+				cli.SWmin += 1
+			} else {
+				break
+			}
+		}
 		return
 
 	case MsgCAck: // if msg is CAck
+		cackSeqNum := msg.SeqNum
+		for i := 1; i <= cackSeqNum; i++ {
+			if cli.UnackedMap[cackSeqNum] != nil {
+				cli.UnackedMap[cackSeqNum] = nil
+			}
+		}
+		for cli.SWmin < cli.SeqNum {
+			_, ok := cli.UnackedMap[cli.SWmin]
+			if !ok { //has been acked
+				cli.SWmin += 1
+			} else {
+				break
+			}
+		}
 		return
 	}
 }
