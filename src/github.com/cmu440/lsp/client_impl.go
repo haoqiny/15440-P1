@@ -109,6 +109,10 @@ func (c *client) Write(payload []byte) error {
 		fmt.Printf("SeqNum: %d, SWmin: %d, seqNum not in window!\n", c.SeqNum, c.SWmin)
 		return nil
 	}
+	if len(c.UnackedMap) >= c.params.MaxUnackedMessages{
+		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!",c.params.MaxUnackedMessages,len(c.UnackedMap))
+		return nil
+	}
 	// prepare send data
 	checksum := CalculateChecksum(c.connId, c.SeqNum, len(payload), payload)
 	msg := NewData(c.connId, c.SeqNum, len(payload), payload, checksum)
