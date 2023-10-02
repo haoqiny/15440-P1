@@ -217,7 +217,7 @@ func handleRequest(cli *client, msg *Message) {
 				delete(cli.UnackedMap, i)
 			}
 		}
-		for cli.SWmin < cli.SeqNum {
+		for {
 			_, ok := cli.UnackedMap[cli.SWmin]
 			if !ok && cli.SWmin < cli.SeqNum { //has been acked
 				cli.SWmin += 1
