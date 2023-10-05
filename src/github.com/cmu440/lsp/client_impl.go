@@ -4,6 +4,7 @@ package lsp
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -67,10 +68,29 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 
 	}
 
+	timer := time.NewTimer(time.Duration(params.EpochMillis) * time.Millisecond)
+
 	// read for connection acknowledgement
 	ackData := make([]byte, 2000)
 	n, ackErr := udpConn.Read(ackData)
+
 	if ackErr != nil {
+		currEpoch := 0
+		stay := true
+		for stay {
+			if currEpoch == params.EpochLimit {
+				return nil, errors.New("reach epoch limit, connection dead")
+			}
+			select {
+			case <-timer.C:
+				currEpoch += 1
+				udpConn.Write(data)
+				n, ackErr = udpConn.Read(ackData)
+				if ackErr == nil {
+					stay = false
+				}
+			}
+		}
 		return nil, ackErr
 	}
 
@@ -122,8 +142,8 @@ func (c *client) Write(payload []byte) error {
 		fmt.Printf("SeqNum: %d, SWmin: %d, seqNum not in window!\n", c.SeqNum, c.SWmin)
 		return nil
 	}
-	if len(c.UnackedMap) >= c.params.MaxUnackedMessages{
-		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!",c.params.MaxUnackedMessages,len(c.UnackedMap))
+	if len(c.UnackedMap) >= c.params.MaxUnackedMessages {
+		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!", c.params.MaxUnackedMessages, len(c.UnackedMap))
 		return nil
 	}
 	// prepare send data
