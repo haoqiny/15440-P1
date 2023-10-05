@@ -84,7 +84,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 			case <-timer.C:
 				currEpoch += 1
 				udpConn.Write(data)
-				n, ackErr = udpConn.Read(ackData)
+				_, ackErr = udpConn.Read(ackData)
 				if ackErr == nil {
 					stay = false
 				}
@@ -149,13 +149,8 @@ func (c *client) Write(payload []byte) error {
 	checksum := CalculateChecksum(c.connId, c.SeqNum, len(payload), payload)
 	msg := NewData(c.connId, c.SeqNum, len(payload), payload, checksum)
 
-	data, err := json.Marshal(msg)
-	if err == nil {
-		res := &cliMsg{CurrentBackoff: 0, BackoffIndex: 0, Message: msg}
-		c.conn.Write(data)
-		c.UnackedMap[c.SeqNum] = res
-		c.SeqNum += 1
-	}
+	c.sendChan <- msg
+	
 	return nil
 }
 
@@ -211,10 +206,11 @@ func mainRoutine(cli *client) {
 		case sendMsg := <-cli.sendChan: // if we want to send anything to server
 			data, err := json.Marshal(sendMsg)
 			if err == nil {
+				res := &cliMsg{CurrentBackoff: 0, BackoffIndex: 0, Message: sendMsg}
 				cli.conn.Write(data)
+				cli.UnackedMap[cli.SeqNum] = res
 				cli.SeqNum += 1
 			}
-
 		case <-cli.closeChan:
 			cli.conn.Close()
 			return
