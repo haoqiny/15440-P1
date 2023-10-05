@@ -5,6 +5,8 @@ package lsp
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"time"
 
 	lspnet "github.com/cmu440/lspnet"
 )
@@ -20,8 +22,17 @@ type client struct {
 	mapHead     int              // the SN we are looking for next
 	SWmin       int              // the min index of the sliding window
 	MsgMap      map[int]*Message // map for storing all (possible out-of-order) incoming data
-	UnackedMap  map[int]*Message // map for storing unacked messages
+	UnackedMap  map[int]*cliMsg // map for storing unacked messages
 	params      *Params
+	ticker		*time.Ticker
+	epoch		int
+	CurrentBackoff int
+}
+
+type cliMsg struct {
+	Message		*Message
+	BackoffIndex int
+	CurrentBackoff int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -38,7 +49,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-	
+	ticker := time.NewTicker(2*time.Second)
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -81,8 +92,10 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		mapHead:     initialSeqNum + 1,
 		SWmin:       initialSeqNum + 1,
 		MsgMap:      make(map[int]*Message),
-		UnackedMap:  make(map[int]*Message),
+		UnackedMap:  make(map[int]*cliMsg),
 		params:      params,
+		ticker: 	 ticker,
+		epoch:		 0, 
 	}
 
 	go readRoutine(cli)
@@ -119,8 +132,9 @@ func (c *client) Write(payload []byte) error {
 
 	data, err := json.Marshal(msg)
 	if err == nil {
+		res := &cliMsg{CurrentBackoff: 0, BackoffIndex: 0, Message: msg}
 		c.conn.Write(data)
-		c.UnackedMap[c.SeqNum] = msg
+		c.UnackedMap[c.SeqNum] = res
 		c.SeqNum += 1
 	}
 	return nil
@@ -154,6 +168,24 @@ func readRoutine(cli *client) {
 func mainRoutine(cli *client) {
 	for {
 		select {
+		case <-cli.ticker.C:
+			for _, value := range cli.UnackedMap {
+				if value.CurrentBackoff == 0{
+					data, err := json.Marshal(value.Message)
+					if err == nil {
+						cli.conn.Write(data)
+						nextEpoch := int(math.Exp(float64(value.BackoffIndex)))
+						// if nextEpoch > MaxBackOffInterval {
+						// 	nextEpoch = nextEpoch / 2
+						// }
+						value.CurrentBackoff = nextEpoch
+						value.BackoffIndex += 1
+					}
+				} else {
+					value.CurrentBackoff -= 1
+				}
+			}
+			cli.epoch++
 		case msg := <-cli.receiveChan: // if we received anything from server
 			handleRequest(cli, msg)
 

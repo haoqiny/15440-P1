@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	lspnet "github.com/cmu440/lspnet"
 )
@@ -18,7 +19,9 @@ type server struct {
 	listen      *lspnet.UDPConn
 	clientID    int              // used to assign connID for the next connected client
 	ClientMap   map[int]*Nclient // a map that uses ConnID as the key and *Nclient as value
-	params		*Params
+	params      *Params
+	ticker		*time.Ticker
+	epoch		int
 }
 
 // struct for receiveChan
@@ -29,14 +32,14 @@ type receivedMessage struct {
 
 // client information used by the server
 type Nclient struct {
-	ConnID  int              // the connection id given by the server
-	addr    *lspnet.UDPAddr  // the addr of client
-	Conn    *lspnet.UDPConn  // the UDPConn of client
-	seqNum  int              // the server-side sequence number for this particular client
-	mapHead int              // the next expected sequence number from client
-	SWmin   int				 // min index for sliding window
-	msgMap  map[int]*Message // databuffer to store data received from client
-	unackedMap  map[int]*Message //unacked messages
+	ConnID     int              // the connection id given by the server
+	addr       *lspnet.UDPAddr  // the addr of client
+	Conn       *lspnet.UDPConn  // the UDPConn of client
+	seqNum     int              // the server-side sequence number for this particular client
+	mapHead    int              // the next expected sequence number from client
+	SWmin      int              // min index for sliding window
+	msgMap     map[int]*Message // databuffer to store data received from client
+	unackedMap map[int]*Message //unacked messages
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -46,6 +49,7 @@ type Nclient struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
+	ticker := time.NewTicker(2*time.Second)
 	port_num := strconv.Itoa(port)
 	ln, err := lspnet.ResolveUDPAddr("udp", "localhost:"+port_num)
 	if err != nil {
@@ -64,6 +68,8 @@ func NewServer(port int, params *Params) (Server, error) {
 		clientID:    1,
 		listen:      listen,
 		params:      params,
+		ticker:		 ticker,
+		epoch:		 0,
 	}
 
 	go readRoutineServer(svr)
@@ -85,8 +91,8 @@ func (s *server) Write(connId int, payload []byte) error {
 		fmt.Printf("SeqNum: %d, SWmin: %d, seqNum not in window!\n", c.seqNum, c.SWmin)
 		return nil
 	}
-	if len(c.unackedMap) >= s.params.MaxUnackedMessages{
-		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!",s.params.MaxUnackedMessages,len(c.unackedMap))
+	if len(c.unackedMap) >= s.params.MaxUnackedMessages {
+		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!", s.params.MaxUnackedMessages, len(c.unackedMap))
 		return nil
 	}
 	// prepare new data for sending
@@ -119,6 +125,8 @@ func (s *server) Close() error {
 func mainRoutineServer(svr *server) {
 	for {
 		select {
+		case <-svr.ticker.C:
+			svr.epoch++;
 		case sendMsg := <-svr.sendChan: // if we are trying to send
 			data, err := json.Marshal(sendMsg)
 			if err == nil {
@@ -174,12 +182,12 @@ func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		}
 
 		client := &Nclient{
-			ConnID:  svr.clientID,
-			addr:    addr,
-			seqNum:  msg.SeqNum + 1,
-			mapHead: msg.SeqNum + 1,
-			SWmin:  msg.SeqNum + 1,
-			msgMap:  make(map[int]*Message),
+			ConnID:     svr.clientID,
+			addr:       addr,
+			seqNum:     msg.SeqNum + 1,
+			mapHead:    msg.SeqNum + 1,
+			SWmin:      msg.SeqNum + 1,
+			msgMap:     make(map[int]*Message),
 			unackedMap: make(map[int]*Message),
 		}
 
