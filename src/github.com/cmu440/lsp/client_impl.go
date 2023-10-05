@@ -27,7 +27,6 @@ type client struct {
 	params      *Params
 	ticker		*time.Ticker
 	epoch		int
-	CurrentBackoff int
 }
 
 type cliMsg struct {
@@ -50,7 +49,7 @@ type cliMsg struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-	ticker := time.NewTicker(2*time.Second)
+	ticker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -195,9 +194,9 @@ func mainRoutine(cli *client) {
 					if err == nil {
 						cli.conn.Write(data)
 						nextEpoch := int(math.Exp(float64(value.BackoffIndex)))
-						// if nextEpoch > MaxBackOffInterval {
-						// 	nextEpoch = nextEpoch / 2
-						// }
+						if nextEpoch > cli.params.MaxBackOffInterval {
+							nextEpoch = nextEpoch / 2
+						}
 						value.CurrentBackoff = nextEpoch
 						value.BackoffIndex += 1
 					}

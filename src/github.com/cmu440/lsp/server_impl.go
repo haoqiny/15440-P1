@@ -5,6 +5,7 @@ package lsp
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -39,7 +40,13 @@ type Nclient struct {
 	mapHead    int              // the next expected sequence number from client
 	SWmin      int              // min index for sliding window
 	msgMap     map[int]*Message // databuffer to store data received from client
-	unackedMap map[int]*Message //unacked messages
+	unackedMap map[int]*cliMsg  //unacked messages
+}
+
+type cliMsg struct {
+	Message		*Message
+	BackoffIndex int
+	CurrentBackoff int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -49,7 +56,7 @@ type Nclient struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
-	ticker := time.NewTicker(2*time.Second)
+	ticker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	port_num := strconv.Itoa(port)
 	ln, err := lspnet.ResolveUDPAddr("udp", "localhost:"+port_num)
 	if err != nil {
@@ -101,11 +108,11 @@ func (s *server) Write(connId int, payload []byte) error {
 
 	data, err := json.Marshal(sendMsg)
 	if err == nil {
+		res := &cliMsg{CurrentBackoff: 0, BackoffIndex: 0, Message: msg}
 		s.listen.WriteToUDP(data, c.addr)
-		c.unackedMap[c.seqNum] = sendMsg
+		c.unackedMap[c.seqNum] = res
 		c.seqNum += 1
 	}
-
 	return nil
 }
 
@@ -126,7 +133,25 @@ func mainRoutineServer(svr *server) {
 	for {
 		select {
 		case <-svr.ticker.C:
-			svr.epoch++;
+			for _, client := range svr.ClientMap {
+				for _, value := range client.unackedMap {
+					if value.CurrentBackoff == 0{
+						data, err := json.Marshal(value.Message)
+						if err == nil {
+							client.Conn.Write(data)
+							nextEpoch := int(math.Exp(float64(value.BackoffIndex)))
+							if nextEpoch > svr.params.MaxBackOffInterval {
+								nextEpoch = nextEpoch / 2
+							}
+							value.CurrentBackoff = nextEpoch
+							value.BackoffIndex += 1
+						}
+					} else {
+						value.CurrentBackoff -= 1
+					}
+				}
+			}
+			svr.epoch++
 		case sendMsg := <-svr.sendChan: // if we are trying to send
 			data, err := json.Marshal(sendMsg)
 			if err == nil {
@@ -173,6 +198,11 @@ func readRoutineServer(svr *server) {
 func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	switch msg.Type {
 	case MsgConnect: // if msg is connect
+		for _, connectedCli := range svr.ClientMap {
+			if connectedCli.addr.String() == addr.String() {
+				return
+			}
+		}
 
 		// ack right away
 		ackMsg := NewAck(svr.clientID, msg.SeqNum)
