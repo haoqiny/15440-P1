@@ -5,24 +5,21 @@ package lsp
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"strconv"
-	"time"
 
 	lspnet "github.com/cmu440/lspnet"
 )
 
 type server struct {
 	receiveChan chan *receivedMessage
-	sendChan    chan *Message
+	writeMiddleChan chan *writeMessage
+	writeChan    chan *writeMessage
 	readChan    chan *Message
 	closeChan   chan int
 	listen      *lspnet.UDPConn
 	clientID    int              // used to assign connID for the next connected client
 	ClientMap   map[int]*Nclient // a map that uses ConnID as the key and *Nclient as value
-	params      *Params
-	ticker		*time.Ticker
-	epoch		int
+	params		*Params
 }
 
 // struct for receiveChan
@@ -31,22 +28,21 @@ type receivedMessage struct {
 	payload *Message        // the actual msg sent by client
 }
 
+type writeMessage struct{
+	connId		int
+	payload		[]byte
+}
 // client information used by the server
 type Nclient struct {
-	ConnID     int              // the connection id given by the server
-	addr       *lspnet.UDPAddr  // the addr of client
-	Conn       *lspnet.UDPConn  // the UDPConn of client
-	seqNum     int              // the server-side sequence number for this particular client
-	mapHead    int              // the next expected sequence number from client
-	SWmin      int              // min index for sliding window
-	msgMap     map[int]*Message // databuffer to store data received from client
-	unackedMap map[int]*cliMsg  //unacked messages
-}
-
-type cliMsg struct {
-	Message		*Message
-	BackoffIndex int
-	CurrentBackoff int
+	connID  int              // the connection id given by the server
+	addr    *lspnet.UDPAddr  // the addr of client
+	Conn    *lspnet.UDPConn  // the UDPConn of client
+	SeqNum  int              // the server-side sequence number for this particular client
+	mapHead int              // the next expected sequence number from client
+	SWmin   int				 // min index for sliding window
+	msgMap  map[int]*Message // databuffer to store data received from client
+	UnackedMap  map[int]*Message //unacked messages
+	WriteMap    map[int]*Message
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -56,7 +52,6 @@ type cliMsg struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
-	ticker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	port_num := strconv.Itoa(port)
 	ln, err := lspnet.ResolveUDPAddr("udp", "localhost:"+port_num)
 	if err != nil {
@@ -68,19 +63,19 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	svr := &server{
-		sendChan:    make(chan *Message),
+		writeChan:    make(chan *writeMessage),
+		writeMiddleChan: make(chan *writeMessage),
 		readChan:    make(chan *Message),
 		receiveChan: make(chan *receivedMessage),
 		ClientMap:   make(map[int]*Nclient),
 		clientID:    1,
 		listen:      listen,
 		params:      params,
-		ticker:		 ticker,
-		epoch:		 0,
 	}
 
 	go readRoutineServer(svr)
 	go mainRoutineServer(svr)
+	
 	return svr, nil
 }
 
@@ -92,27 +87,13 @@ func (s *server) Read() (int, []byte, error) {
 
 // write to the specified connection ID
 func (s *server) Write(connId int, payload []byte) error {
-	c := s.ClientMap[connId]
-	SWmax := c.SWmin + s.params.WindowSize - 1
-	if c.seqNum < c.SWmin || c.seqNum > SWmax { //seqNum not in window
-		fmt.Printf("SeqNum: %d, SWmin: %d, seqNum not in window!\n", c.seqNum, c.SWmin)
-		return nil
+	data := &writeMessage{
+		connId: connId,
+		payload: payload,
 	}
-	if len(c.unackedMap) >= s.params.MaxUnackedMessages {
-		fmt.Printf("MaxUnackedMsg: %d, currUnackedMsg: %d, cant send!", s.params.MaxUnackedMessages, len(c.unackedMap))
-		return nil
-	}
-	// prepare new data for sending
-	checksum := CalculateChecksum(connId, s.ClientMap[connId].seqNum, len(payload), payload)
-	sendMsg := NewData(connId, s.ClientMap[connId].seqNum, len(payload), payload, checksum)
-
-	data, err := json.Marshal(sendMsg)
-	if err == nil {
-		res := &cliMsg{CurrentBackoff: 0, BackoffIndex: 0, Message: msg}
-		s.listen.WriteToUDP(data, c.addr)
-		c.unackedMap[c.seqNum] = res
-		c.seqNum += 1
-	}
+	fmt.Println("send data to WriteChan")
+	s.writeMiddleChan <- data
+	fmt.Println("finish send data to WriteChan")
 	return nil
 }
 
@@ -128,39 +109,22 @@ func (s *server) Close() error {
 	return nil
 }
 
+
 // handles all incoming or outgoing request for the server
 func mainRoutineServer(svr *server) {
 	for {
 		select {
-		case <-svr.ticker.C:
-			for _, client := range svr.ClientMap {
-				for _, value := range client.unackedMap {
-					if value.CurrentBackoff == 0{
-						data, err := json.Marshal(value.Message)
-						if err == nil {
-							client.Conn.Write(data)
-							nextEpoch := int(math.Exp(float64(value.BackoffIndex)))
-							if nextEpoch > svr.params.MaxBackOffInterval {
-								nextEpoch = nextEpoch / 2
-							}
-							value.CurrentBackoff = nextEpoch
-							value.BackoffIndex += 1
-						}
-					} else {
-						value.CurrentBackoff -= 1
-					}
-				}
-			}
-			svr.epoch++
-		case sendMsg := <-svr.sendChan: // if we are trying to send
-			data, err := json.Marshal(sendMsg)
-			if err == nil {
-				svr.listen.WriteToUDP(data, svr.ClientMap[sendMsg.ConnID].addr)
-				svr.ClientMap[sendMsg.ConnID].seqNum += 1
-			}
+		case sendMsg := <-svr.writeChan: // if we are trying to send
+			cli := svr.ClientMap[sendMsg.connId]
+			checksum := CalculateChecksum(cli.connID, cli.SeqNum, len(sendMsg.payload), sendMsg.payload)
+			msg := NewData(cli.connID, cli.SeqNum, len(sendMsg.payload), sendMsg.payload, checksum)
+			//fmt.Println(sendMsg.SeqNum)
+			cli.WriteMap[msg.SeqNum] = msg
+			cli.SeqNum ++
+			handleWriteServer(svr, cli)
 
 		case Received := <-svr.receiveChan: // if we have received msg from client
-			handleRequestServer(svr, Received.payload, Received.addr)
+			handleReadServer(svr, Received.payload, Received.addr)
 
 		case <-svr.closeChan:
 			svr.listen.Close()
@@ -168,6 +132,33 @@ func mainRoutineServer(svr *server) {
 	}
 }
 
+func handleWriteServer(svr *server, cli *Nclient){
+	//fmt.Println("enter handleWriteSvr")
+	for {
+		_, ok1 := cli.UnackedMap[cli.SWmin]
+		_, ok2 := cli.WriteMap[cli.SWmin]
+		if !ok1 && !ok2 && cli.SWmin < cli.SeqNum { //has been acked
+			cli.SWmin += 1
+		} else {
+			break
+		}
+	}
+	SWmax := cli.SWmin + svr.params.WindowSize - 1
+	for i := cli.SWmin; i <= SWmax; i++{
+		sendMsg, ok := cli.WriteMap[i]
+		//fmt.Println(cli.SeqNum)
+		//fmt.Println(cli.SWmin)
+		
+		if ok && len(cli.UnackedMap) < svr.params.MaxUnackedMessages{
+			data, _ := json.Marshal(sendMsg)
+			//fmt.Println(sendMsg)
+			svr.listen.WriteToUDP(data, cli.addr)
+			cli.UnackedMap[sendMsg.SeqNum] = sendMsg
+			delete(cli.WriteMap,sendMsg.SeqNum)
+		} 
+	}
+	//fmt.Println("exit handleWriteSvr")
+}
 // when server reads from the UDPConn
 func readRoutineServer(svr *server) {
 	for {
@@ -195,14 +186,9 @@ func readRoutineServer(svr *server) {
 }
 
 // helper function called in mainRoutine to handle specific incoming msg packet
-func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
+func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	switch msg.Type {
 	case MsgConnect: // if msg is connect
-		for _, connectedCli := range svr.ClientMap {
-			if connectedCli.addr.String() == addr.String() {
-				return
-			}
-		}
 
 		// ack right away
 		ackMsg := NewAck(svr.clientID, msg.SeqNum)
@@ -212,13 +198,14 @@ func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		}
 
 		client := &Nclient{
-			ConnID:     svr.clientID,
-			addr:       addr,
-			seqNum:     msg.SeqNum + 1,
-			mapHead:    msg.SeqNum + 1,
-			SWmin:      msg.SeqNum + 1,
-			msgMap:     make(map[int]*Message),
-			unackedMap: make(map[int]*Message),
+			connID:  svr.clientID,
+			addr:    addr,
+			SeqNum:  msg.SeqNum + 1,
+			mapHead: msg.SeqNum + 1,
+			SWmin:  msg.SeqNum + 1,
+			msgMap:  make(map[int]*Message),
+			UnackedMap: make(map[int]*Message),
+			WriteMap:    make(map[int]*Message),
 		}
 
 		// add new client into map
@@ -241,7 +228,9 @@ func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		for { // if it correspond to the exepcted SN, put the data into readChan
 			tempMsg, ok := svr.ClientMap[msg.ConnID].msgMap[svr.ClientMap[msg.ConnID].mapHead]
 			if ok {
+				fmt.Println("send to readchan")
 				svr.readChan <- tempMsg
+				fmt.Println("finish send to readchan")
 				svr.ClientMap[msg.ConnID].mapHead += 1
 			} else {
 				break
@@ -250,37 +239,22 @@ func handleRequestServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	case MsgAck: // if msg is Ack
 		cli := svr.ClientMap[msg.ConnID]
 		ackSeqNum := msg.SeqNum
-		if cli.unackedMap[ackSeqNum] == nil {
+		if cli.UnackedMap[ackSeqNum] == nil {
 			fmt.Println("error occured, acking a nil message")
 			return
 		}
-		delete(cli.unackedMap, ackSeqNum)
-		for {
-			_, ok := cli.unackedMap[cli.SWmin]
-			if !ok && cli.SWmin < cli.seqNum { //has been acked
-				//fmt.Printf("SWmin: %d -> %d\n", cli.SWmin, cli.SWmin+1)
-				cli.SWmin += 1
-			} else {
-				break
-			}
-		}
+		delete(cli.UnackedMap, ackSeqNum)
+		handleWriteServer(svr, cli)
 		return
 	case MsgCAck: // if msg is CAck
 		cli := svr.ClientMap[msg.ConnID]
 		cackSeqNum := msg.SeqNum
 		for i := 1; i <= cackSeqNum; i++ {
-			if cli.unackedMap[i] != nil {
-				delete(cli.unackedMap, i)
+			if cli.UnackedMap[i] != nil {
+				delete(cli.UnackedMap, i)
 			}
 		}
-		for {
-			_, ok := cli.unackedMap[cli.SWmin]
-			if !ok && cli.SWmin < cli.seqNum { //has been acked
-				cli.SWmin += 1
-			} else {
-				break
-			}
-		}
+		handleWriteServer(svr, cli)
 		return
 	}
 
