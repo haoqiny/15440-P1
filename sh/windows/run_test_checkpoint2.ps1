@@ -42,9 +42,9 @@ go test -run=TestCAckServer3 -timeout=20s -race
 go test -run=TestCAckServer4 -timeout=20s -race
 go test -run=TestVariableLengthMsgServer -timeout=3s -race
 go test -run=TestVariableLengthMsgClient -timeout=3s
-
 go test -run=TestServerSlowStart1 -timeout=5s -race
 go test -run=TestServerSlowStart2 -timeout=5s -race
+
 go test -run=TestServerClose1 -timeout=10s -race
 go test -run=TestServerClose2 -timeout=10s -race
 go test -run=TestServerCloseConns1 -timeout=10s -race

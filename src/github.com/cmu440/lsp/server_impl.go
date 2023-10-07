@@ -25,6 +25,7 @@ type server struct {
 	pendingRead     bool
 	ticker          *time.Ticker
 	epoch           int
+
 }
 
 // struct for receiveChan
@@ -42,7 +43,7 @@ type writeMessage struct {
 type Nclient struct {
 	connID     int              // the connection id given by the server
 	addr       *lspnet.UDPAddr  // the addr of client
-	Conn       *lspnet.UDPConn  // the UDPConn of client
+	
 	SeqNum     int              // the server-side sequence number for this particular client
 	mapHead    int              // the next expected sequence number from client
 	SWmin      int              // min index for sliding window
@@ -50,6 +51,8 @@ type Nclient struct {
 	UnackedMap map[int]*cliMsg  //unacked messages
 	WriteMap   map[int]*Message
 	epoch      int
+	heartbeat  bool
+	closing	   bool
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -133,9 +136,14 @@ func mainRoutineServer(svr *server) {
 	for {
 		select {
 		case id := <-svr.closeClientChan:
-			if svr.ClientMap[id] == nil {
+			client, ok := svr.ClientMap[id] 
+			if ok && len(client.WriteMap) == 0 && len(client.UnackedMap) == 0 {
+				
 				delete(svr.ClientMap, id)
+			} else {
+				client.closing = true
 			}
+			
 		case <-svr.readRequest:
 			//fmt.Println("server trying to read something")
 			read := 0
@@ -164,6 +172,11 @@ func mainRoutineServer(svr *server) {
 			//fmt.Println("server received something")
 			handleReadServer(svr, Received.payload, Received.addr)
 			//fmt.Println("server read")
+			client, ok := svr.ClientMap[Received.payload.ConnID]
+			if ok && client.closing && len(client.WriteMap) == 0 && len(client.UnackedMap) == 0 {
+				
+				delete(svr.ClientMap, client.connID)
+			}
 
 		case <-svr.closeChan:
 			svr.listen.Close()
@@ -171,19 +184,30 @@ func mainRoutineServer(svr *server) {
 		case <-svr.ticker.C:
 			// fmt.Println("enter tikers")
 			for index, client := range svr.ClientMap {
-				// fmt.Println("llllllllllll")
-				// fmt.Println(client)
 				if client.epoch == svr.params.EpochLimit {
+					fmt.Println("deleting client with ID")
+					fmt.Println(client.connID)
 					delete(svr.ClientMap, index)
 					continue
 				}
+
+				if client.heartbeat { // if need to send heartbeat
+					heartbeat := NewAck(client.connID, 0)
+					data, err := json.Marshal(heartbeat)
+					if err == nil {
+						svr.listen.WriteToUDP(data, client.addr)
+					}
+				}
+				client.heartbeat = true
 				for _, value := range client.UnackedMap {
 					if value.CurrentBackoff == 0 {
 						data, err := json.Marshal(value.Message)
 						if err == nil {
 							// fmt.Println(client.Conn)
 							svr.listen.WriteToUDP(data, client.addr)
-
+							if value.Message.Type == MsgData{
+								client.heartbeat = false
+							}
 							var nextEpoch int
 							if value.PrevBackoff == 0 {
 								nextEpoch = 1
@@ -229,6 +253,9 @@ func handleWriteServer(svr *server, cli *Nclient) {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			svr.listen.WriteToUDP(data, cli.addr)
+			fmt.Println("server write to client")
+			fmt.Println(sendMsg)
+			cli.heartbeat = false
 			res := &cliMsg{CurrentBackoff: 0, PrevBackoff: 0, Message: sendMsg}
 			cli.UnackedMap[sendMsg.SeqNum] = res
 			delete(cli.WriteMap, sendMsg.SeqNum)
@@ -288,6 +315,8 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 			UnackedMap: make(map[int]*cliMsg),
 			WriteMap:   make(map[int]*Message),
 			epoch:      0,
+			heartbeat:  false,
+			closing:	false,
 		}
 
 		// add new client into map
@@ -331,15 +360,20 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	case MsgAck: // if msg is Ack
 		//fmt.Println("server read an Ack")
 
-		cli := svr.ClientMap[msg.ConnID]
+		cli, ok := svr.ClientMap[msg.ConnID]
+		if !ok{
+			return
+		}
 		ackSeqNum := msg.SeqNum
-		if cli.UnackedMap[ackSeqNum] == nil {
-			fmt.Println("error occured, acking a nil message")
+		svr.ClientMap[msg.ConnID].epoch = 0
+		_, ok = cli.UnackedMap[ackSeqNum] 
+		if !ok {
+			//fmt.Println("error occured, acking a nil message")
 			return
 		}
 		delete(cli.UnackedMap, ackSeqNum)
 		handleWriteServer(svr, cli)
-		svr.ClientMap[msg.ConnID].epoch = 0
+		
 		//fmt.Println("server finished reading Ack")
 		return
 	case MsgCAck: // if msg is CAck

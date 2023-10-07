@@ -5,7 +5,6 @@ package lsp
 import (
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	lspnet "github.com/cmu440/lspnet"
@@ -17,6 +16,7 @@ type client struct {
 	readChan    chan *Message // channel for Read()
 	writeChan   chan []byte   // channel for msg send to server
 	closeChan   chan int      // channel for signalling close
+	closeReceiveChan chan int
 	readRequest chan int
 	conn        *lspnet.UDPConn  // UDP connection
 	SeqNum      int              // client side SN
@@ -24,11 +24,13 @@ type client struct {
 	SWmin       int              // the min index of the sliding window
 	MsgMap      map[int]*Message // map for storing all (possible out-of-order) incoming data
 	UnackedMap  map[int]*cliMsg  // map for storing unacked messages
-	WriteMap    map[int]*Message
+	WriteMap    map[int]*Message // msgs that have not been transmitted due to sw
 	params      *Params
 	pendingRead bool
 	ticker      *time.Ticker
 	epoch       int
+	heartbeat	bool
+	closing     bool
 }
 
 type cliMsg struct {
@@ -77,27 +79,26 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		currEpoch := 0
 		stay := true
 		for stay {
-			fmt.Println(ackErr)
-			fmt.Println(currEpoch)
+			
 			if currEpoch == params.EpochLimit {
 				return nil, errors.New("reach epoch limit, connection dead")
 			}
 			select {
 			case <-connectionTicker.C:
-				fmt.Println("one epoch pass")
+
 				currEpoch += 1
 				udpConn.Write(data)
 				n, ackErr = udpConn.Read(ackData)
-				fmt.Println(ackData)
+				
 				if ackErr == nil {
-					fmt.Println("read ack success")
+					
 					stay = false
 				}
 			}
 		}
 
 	}
-	fmt.Println(ackErr)
+	
 	var msg Message
 	err = json.Unmarshal(ackData[:n], &msg)
 
@@ -119,6 +120,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		writeChan:   make(chan []byte),
 		readChan:    make(chan *Message),
 		closeChan:   make(chan int),
+		closeReceiveChan: make(chan int),
 		readRequest: make(chan int),
 		conn:        udpConn,
 		SeqNum:      initialSeqNum + 1,
@@ -131,6 +133,8 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		pendingRead: false,
 		ticker:      ticker,
 		epoch:       0,
+		heartbeat:   false,
+		closing:     false,
 	}
 
 	go readRoutine(cli)
@@ -164,6 +168,7 @@ func (c *client) Write(payload []byte) error {
 // close client
 func (c *client) Close() error {
 	c.closeChan <- 1
+	<-c.closeReceiveChan 
 	return nil
 }
 
@@ -190,6 +195,9 @@ func mainRoutine(cli *client) {
 	for {
 		select {
 		case <-cli.readRequest:
+			if cli.closing{
+				continue
+			}
 			//fmt.Println("server trying to read something")
 			read := 0
 
@@ -207,28 +215,55 @@ func mainRoutine(cli *client) {
 		case msg := <-cli.receiveChan: // if we received anything from server
 			handleRead(cli, msg)
 			cli.epoch = 0
+			if cli.closing && len(cli.WriteMap) == 0 && len(cli.UnackedMap) == 0 {
+				cli.conn.Close()
+				cli.closeReceiveChan <- 1
+				return
+			}
 
 		case payload := <-cli.writeChan: // if we want to send anything to server
 			checksum := CalculateChecksum(cli.connId, cli.SeqNum, len(payload), payload)
 			sendMsg := NewData(cli.connId, cli.SeqNum, len(payload), payload, checksum)
 			//fmt.Println(sendMsg.SeqNum)
+			if cli.closing{
+				continue
+			}
 			cli.WriteMap[sendMsg.SeqNum] = sendMsg
 			cli.SeqNum++
 			handleWrite(cli)
 
 		case <-cli.closeChan:
-			cli.conn.Close()
-			return
+			if len(cli.WriteMap) == 0 && len(cli.UnackedMap) == 0 {
+				cli.conn.Close()
+				cli.closeReceiveChan <- 1
+				return
+			} else {
+				cli.closing = true
+			}
 
 		case <-cli.ticker.C:
 			if cli.epoch == cli.params.EpochLimit {
-				cli.closeChan <- 1
+				cli.conn.Close()
+				return
 			}
+
+			if cli.heartbeat { // if need to send heartbeat
+				heartbeat := NewAck(cli.connId, 0)
+				data, err := json.Marshal(heartbeat)
+				if err == nil {
+					cli.conn.Write(data)
+				}
+			}
+
+			cli.heartbeat = true
 			for _, value := range cli.UnackedMap {
 				if value.CurrentBackoff == 0 {
 					data, err := json.Marshal(value.Message)
 					if err == nil {
 						cli.conn.Write(data)
+						if value.Message.Type == MsgData {
+							cli.heartbeat = false
+						}
 						var nextEpoch int
 						if value.PrevBackoff == 0 {
 							nextEpoch = 1
@@ -272,6 +307,7 @@ func handleWrite(cli *client) {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			cli.conn.Write(data)
+			cli.heartbeat = false
 			res := &cliMsg{CurrentBackoff: 0, PrevBackoff: 0, Message: sendMsg}
 			cli.UnackedMap[sendMsg.SeqNum] = res
 			delete(cli.WriteMap, sendMsg.SeqNum)
@@ -315,7 +351,8 @@ func handleRead(cli *client, msg *Message) {
 
 	case MsgAck: // if msg is Ack
 		ackSeqNum := msg.SeqNum
-		if cli.UnackedMap[ackSeqNum] == nil {
+		_, ok := cli.UnackedMap[ackSeqNum]
+		if !ok {
 			//fmt.Println("error occured, acking a nil message")
 			return
 		}
