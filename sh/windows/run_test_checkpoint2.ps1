@@ -34,6 +34,15 @@ go test -run=TestMaxUnackedMessages3 -timeout=60s -race
 go test -run=TestMaxUnackedMessages4 -timeout=60s -race
 go test -run=TestMaxUnackedMessages5 -timeout=60s -race
 go test -run=TestMaxUnackedMessages6 -timeout=60s -race
+go test -run=TestCorruptedMsgServer -timeout=3s -race
+go test -run=TestCorruptedMsgClient -timeout=3s
+go test -run=TestCAckServer1 -timeout=20s -race
+go test -run=TestCAckServer2 -timeout=20s -race
+go test -run=TestCAckServer3 -timeout=20s -race
+go test -run=TestCAckServer4 -timeout=20s -race
+go test -run=TestVariableLengthMsgServer -timeout=3s -race
+go test -run=TestVariableLengthMsgClient -timeout=3s
+
 go test -run=TestServerSlowStart1 -timeout=5s -race
 go test -run=TestServerSlowStart2 -timeout=5s -race
 go test -run=TestServerClose1 -timeout=10s -race
@@ -54,11 +63,4 @@ go test -run=TestClientToServer3 -timeout=20s
 go test -run=TestRoundTrip1 -timeout=20s -race
 go test -run=TestRoundTrip2 -timeout=20s
 go test -run=TestRoundTrip3 -timeout=30s
-go test -run=TestVariableLengthMsgServer -timeout=3s -race
-go test -run=TestVariableLengthMsgClient -timeout=3s
-go test -run=TestCorruptedMsgServer -timeout=3s -race
-go test -run=TestCorruptedMsgClient -timeout=3s
-go test -run=TestCAckServer1 -timeout=20s -race
-go test -run=TestCAckServer2 -timeout=20s -race
-go test -run=TestCAckServer3 -timeout=20s -race
-go test -run=TestCAckServer4 -timeout=20s -race
+

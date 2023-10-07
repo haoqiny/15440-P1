@@ -6,21 +6,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	lspnet "github.com/cmu440/lspnet"
 )
 
 type server struct {
-	receiveChan chan *receivedMessage
-	writeChan   chan *writeMessage //msg with epoch
-	readChan    chan *Message
-	readRequest chan int
-	closeChan   chan int
-	listen      *lspnet.UDPConn
-	clientID    int              // used to assign connID for the next connected client
-	ClientMap   map[int]*Nclient // a map that uses ConnID as the key and *Nclient as value
-	params      *Params
-	pendingRead bool
+	receiveChan     chan *receivedMessage
+	writeChan       chan *writeMessage //msg with epoch
+	readChan        chan *Message
+	readRequest     chan int
+	closeClientChan chan int
+	closeChan       chan int
+	listen          *lspnet.UDPConn
+	clientID        int              // used to assign connID for the next connected client
+	ClientMap       map[int]*Nclient // a map that uses ConnID as the key and *Nclient as value
+	params          *Params
+	pendingRead     bool
+	ticker          *time.Ticker
+	epoch           int
 }
 
 // struct for receiveChan
@@ -43,8 +47,9 @@ type Nclient struct {
 	mapHead    int              // the next expected sequence number from client
 	SWmin      int              // min index for sliding window
 	msgMap     map[int]*Message // databuffer to store data received from client
-	UnackedMap map[int]*Message //unacked messages
+	UnackedMap map[int]*cliMsg  //unacked messages
 	WriteMap   map[int]*Message
+	epoch      int
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -54,6 +59,7 @@ type Nclient struct {
 // project 0, etc.) and immediately return. It should return a non-nil error if
 // there was an error resolving or listening on the specified port number.
 func NewServer(port int, params *Params) (Server, error) {
+	ticker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	port_num := strconv.Itoa(port)
 	ln, err := lspnet.ResolveUDPAddr("udp", "localhost:"+port_num)
 	if err != nil {
@@ -65,15 +71,19 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	svr := &server{
-		writeChan:   make(chan *writeMessage),
-		readChan:    make(chan *Message),
-		readRequest: make(chan int),
-		receiveChan: make(chan *receivedMessage),
-		ClientMap:   make(map[int]*Nclient),
-		clientID:    1,
-		listen:      listen,
-		params:      params,
-		pendingRead: false,
+		writeChan:       make(chan *writeMessage),
+		readChan:        make(chan *Message),
+		readRequest:     make(chan int),
+		receiveChan:     make(chan *receivedMessage),
+		ClientMap:       make(map[int]*Nclient),
+		clientID:        1,
+		listen:          listen,
+		params:          params,
+		pendingRead:     false,
+		ticker:          ticker,
+		epoch:           0,
+		closeClientChan: make(chan int),
+		closeChan:       make(chan int),
 	}
 
 	go readRoutineServer(svr)
@@ -105,7 +115,10 @@ func (s *server) Write(connId int, payload []byte) error {
 
 // close the connection of a particular client
 func (s *server) CloseConn(connId int) error {
-	s.ClientMap[connId] = nil
+	// if s.ClientMap[connId] == nil {
+	//  return errors.New("reach epoch limit, connection dead")
+	// }
+	s.closeClientChan <- connId
 	return nil
 }
 
@@ -119,6 +132,10 @@ func (s *server) Close() error {
 func mainRoutineServer(svr *server) {
 	for {
 		select {
+		case id := <-svr.closeClientChan:
+			if svr.ClientMap[id] == nil {
+				delete(svr.ClientMap, id)
+			}
 		case <-svr.readRequest:
 			//fmt.Println("server trying to read something")
 			read := 0
@@ -150,6 +167,43 @@ func mainRoutineServer(svr *server) {
 
 		case <-svr.closeChan:
 			svr.listen.Close()
+
+		case <-svr.ticker.C:
+			// fmt.Println("enter tikers")
+			for index, client := range svr.ClientMap {
+				// fmt.Println("llllllllllll")
+				// fmt.Println(client)
+				if client.epoch == svr.params.EpochLimit {
+					delete(svr.ClientMap, index)
+					continue
+				}
+				for _, value := range client.UnackedMap {
+					if value.CurrentBackoff == 0 {
+						data, err := json.Marshal(value.Message)
+						if err == nil {
+							// fmt.Println(client.Conn)
+							svr.listen.WriteToUDP(data, client.addr)
+
+							var nextEpoch int
+							if value.PrevBackoff == 0 {
+								nextEpoch = 1
+							} else {
+								nextEpoch = value.PrevBackoff * 2
+							}
+
+							if nextEpoch > svr.params.MaxBackOffInterval {
+								nextEpoch = nextEpoch / 2
+							}
+							value.CurrentBackoff = nextEpoch
+							value.PrevBackoff = value.CurrentBackoff
+						}
+					} else {
+						value.CurrentBackoff -= 1
+					}
+				}
+				client.epoch++
+			}
+			svr.epoch++
 		}
 	}
 }
@@ -175,7 +229,8 @@ func handleWriteServer(svr *server, cli *Nclient) {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			svr.listen.WriteToUDP(data, cli.addr)
-			cli.UnackedMap[sendMsg.SeqNum] = sendMsg
+			res := &cliMsg{CurrentBackoff: 0, PrevBackoff: 0, Message: sendMsg}
+			cli.UnackedMap[sendMsg.SeqNum] = res
 			delete(cli.WriteMap, sendMsg.SeqNum)
 		}
 	}
@@ -212,13 +267,15 @@ func readRoutineServer(svr *server) {
 func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	switch msg.Type {
 	case MsgConnect: // if msg is connect
-		//fmt.Println("server read a connect")
+		fmt.Println("server read a connect")
 
 		// ack right away
+
 		ackMsg := NewAck(svr.clientID, msg.SeqNum)
 		ackData, err := json.Marshal(ackMsg)
 		if err == nil {
 			svr.listen.WriteToUDP(ackData, addr)
+			fmt.Println("server write back a connect ack")
 		}
 
 		client := &Nclient{
@@ -228,8 +285,9 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 			mapHead:    msg.SeqNum + 1,
 			SWmin:      msg.SeqNum + 1,
 			msgMap:     make(map[int]*Message),
-			UnackedMap: make(map[int]*Message),
+			UnackedMap: make(map[int]*cliMsg),
 			WriteMap:   make(map[int]*Message),
+			epoch:      0,
 		}
 
 		// add new client into map
@@ -239,6 +297,11 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	case MsgData: // if msg is data
 		//fmt.Println("server read a data")
 		if len(msg.Payload) < msg.Size {
+			return
+		} else if len(msg.Payload) > msg.Size {
+			msg.Payload = msg.Payload[:msg.Size]
+		}
+		if CalculateChecksum(msg.ConnID, msg.SeqNum, msg.Size, msg.Payload) != msg.Checksum {
 			return
 		}
 
@@ -263,22 +326,11 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 
 			}
 		}
-
-		// for _, client := range svr.ClientMap {
-		//  fmt.Printf("For client = ")
-		//  fmt.Println(client)
-		//  fmt.Printf("maphead is %d\n", client.mapHead)
-		//  for key, value := range client.msgMap {
-		//   fmt.Printf("key = ")
-		//   fmt.Println(key)
-		//   fmt.Printf("value = ")
-		//   fmt.Println(value)
-		//  }
-		// }
-		//fmt.Println("server finish reading a data")
+		svr.ClientMap[msg.ConnID].epoch = 0
 
 	case MsgAck: // if msg is Ack
 		//fmt.Println("server read an Ack")
+
 		cli := svr.ClientMap[msg.ConnID]
 		ackSeqNum := msg.SeqNum
 		if cli.UnackedMap[ackSeqNum] == nil {
@@ -287,10 +339,12 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		}
 		delete(cli.UnackedMap, ackSeqNum)
 		handleWriteServer(svr, cli)
+		svr.ClientMap[msg.ConnID].epoch = 0
 		//fmt.Println("server finished reading Ack")
 		return
 	case MsgCAck: // if msg is CAck
 		//fmt.Println("server read an CAck")
+
 		cli := svr.ClientMap[msg.ConnID]
 		cackSeqNum := msg.SeqNum
 		for i := 1; i <= cackSeqNum; i++ {
@@ -299,6 +353,7 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 			}
 		}
 		handleWriteServer(svr, cli)
+		svr.ClientMap[msg.ConnID].epoch = 0
 		//fmt.Println("server finished reading an CAck")
 		return
 	}

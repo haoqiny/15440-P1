@@ -4,6 +4,9 @@ package lsp
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
 
 	lspnet "github.com/cmu440/lspnet"
 )
@@ -20,10 +23,18 @@ type client struct {
 	mapHead     int              // the SN we are looking for next
 	SWmin       int              // the min index of the sliding window
 	MsgMap      map[int]*Message // map for storing all (possible out-of-order) incoming data
-	UnackedMap  map[int]*Message // map for storing unacked messages
+	UnackedMap  map[int]*cliMsg  // map for storing unacked messages
 	WriteMap    map[int]*Message
 	params      *Params
 	pendingRead bool
+	ticker      *time.Ticker
+	epoch       int
+}
+
+type cliMsg struct {
+	Message        *Message
+	PrevBackoff    int
+	CurrentBackoff int
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -40,7 +51,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-
+	ticker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -50,27 +61,57 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		return nil, err
 	}
 
-	// send a connect request to the server
 	connMsg := NewConnect(initialSeqNum)
 	data, err := json.Marshal(connMsg)
 	if err == nil {
 		udpConn.Write(data)
-
 	}
+
+	connectionTicker := time.NewTicker(time.Duration(params.EpochMillis) * time.Millisecond)
+	// send a connect request to the server
 
 	// read for connection acknowledgement
 	ackData := make([]byte, 2000)
 	n, ackErr := udpConn.Read(ackData)
 	if ackErr != nil {
-		return nil, ackErr
-	}
+		currEpoch := 0
+		stay := true
+		for stay {
+			fmt.Println(ackErr)
+			fmt.Println(currEpoch)
+			if currEpoch == params.EpochLimit {
+				return nil, errors.New("reach epoch limit, connection dead")
+			}
+			select {
+			case <-connectionTicker.C:
+				fmt.Println("one epoch pass")
+				currEpoch += 1
+				udpConn.Write(data)
+				n, ackErr = udpConn.Read(ackData)
+				fmt.Println(ackData)
+				if ackErr == nil {
+					fmt.Println("read ack success")
+					stay = false
+				}
+			}
+		}
 
+	}
+	fmt.Println(ackErr)
 	var msg Message
 	err = json.Unmarshal(ackData[:n], &msg)
 
 	if err != nil {
 		return nil, err
 	}
+
+	// fmt.Println(ackErr)
+	// var msg Message
+	// err = json.Unmarshal(ackData[:n], &msg)
+
+	// if err != nil {
+	//  return nil, err
+	// }
 
 	cli := &client{
 		connId:      msg.ConnID, // use the returned connectionID to construct new client instance
@@ -84,10 +125,12 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		mapHead:     initialSeqNum + 1,
 		SWmin:       initialSeqNum + 1,
 		MsgMap:      make(map[int]*Message),
-		UnackedMap:  make(map[int]*Message),
+		UnackedMap:  make(map[int]*cliMsg),
 		WriteMap:    make(map[int]*Message),
 		params:      params,
 		pendingRead: false,
+		ticker:      ticker,
+		epoch:       0,
 	}
 
 	go readRoutine(cli)
@@ -163,6 +206,7 @@ func mainRoutine(cli *client) {
 			}
 		case msg := <-cli.receiveChan: // if we received anything from server
 			handleRead(cli, msg)
+			cli.epoch = 0
 
 		case payload := <-cli.writeChan: // if we want to send anything to server
 			checksum := CalculateChecksum(cli.connId, cli.SeqNum, len(payload), payload)
@@ -175,6 +219,34 @@ func mainRoutine(cli *client) {
 		case <-cli.closeChan:
 			cli.conn.Close()
 			return
+
+		case <-cli.ticker.C:
+			if cli.epoch == cli.params.EpochLimit {
+				cli.closeChan <- 1
+			}
+			for _, value := range cli.UnackedMap {
+				if value.CurrentBackoff == 0 {
+					data, err := json.Marshal(value.Message)
+					if err == nil {
+						cli.conn.Write(data)
+						var nextEpoch int
+						if value.PrevBackoff == 0 {
+							nextEpoch = 1
+						} else {
+							nextEpoch = value.PrevBackoff * 2
+						}
+
+						if nextEpoch > cli.params.MaxBackOffInterval {
+							nextEpoch = nextEpoch / 2
+						}
+						value.CurrentBackoff = nextEpoch
+						value.PrevBackoff = value.CurrentBackoff
+					}
+				} else {
+					value.CurrentBackoff -= 1
+				}
+			}
+			cli.epoch++
 		}
 	}
 }
@@ -200,7 +272,8 @@ func handleWrite(cli *client) {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			cli.conn.Write(data)
-			cli.UnackedMap[sendMsg.SeqNum] = sendMsg
+			res := &cliMsg{CurrentBackoff: 0, PrevBackoff: 0, Message: sendMsg}
+			cli.UnackedMap[sendMsg.SeqNum] = res
 			delete(cli.WriteMap, sendMsg.SeqNum)
 		}
 	}
@@ -213,7 +286,14 @@ func handleRead(cli *client, msg *Message) {
 	case MsgData: // if msg is data
 		if len(msg.Payload) < msg.Size {
 			return
+		} else if len(msg.Payload) > msg.Size {
+			msg.Payload = msg.Payload[:msg.Size]
 		}
+
+		if CalculateChecksum(msg.ConnID, msg.SeqNum, msg.Size, msg.Payload) != msg.Checksum {
+			return
+		}
+
 		ackMsg := NewAck(cli.connId, msg.SeqNum)
 		data, err := json.Marshal(ackMsg)
 		if err == nil {
