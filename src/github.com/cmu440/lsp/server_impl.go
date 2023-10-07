@@ -12,14 +12,15 @@ import (
 
 type server struct {
 	receiveChan chan *receivedMessage
-	writeMiddleChan chan *writeMessage
-	writeChan    chan *writeMessage
+	writeChan   chan *writeMessage //msg with epoch
 	readChan    chan *Message
+	readRequest chan int
 	closeChan   chan int
 	listen      *lspnet.UDPConn
 	clientID    int              // used to assign connID for the next connected client
 	ClientMap   map[int]*Nclient // a map that uses ConnID as the key and *Nclient as value
-	params		*Params
+	params      *Params
+	pendingRead bool
 }
 
 // struct for receiveChan
@@ -28,21 +29,22 @@ type receivedMessage struct {
 	payload *Message        // the actual msg sent by client
 }
 
-type writeMessage struct{
-	connId		int
-	payload		[]byte
+type writeMessage struct {
+	connId  int
+	payload []byte
 }
+
 // client information used by the server
 type Nclient struct {
-	connID  int              // the connection id given by the server
-	addr    *lspnet.UDPAddr  // the addr of client
-	Conn    *lspnet.UDPConn  // the UDPConn of client
-	SeqNum  int              // the server-side sequence number for this particular client
-	mapHead int              // the next expected sequence number from client
-	SWmin   int				 // min index for sliding window
-	msgMap  map[int]*Message // databuffer to store data received from client
-	UnackedMap  map[int]*Message //unacked messages
-	WriteMap    map[int]*Message
+	connID     int              // the connection id given by the server
+	addr       *lspnet.UDPAddr  // the addr of client
+	Conn       *lspnet.UDPConn  // the UDPConn of client
+	SeqNum     int              // the server-side sequence number for this particular client
+	mapHead    int              // the next expected sequence number from client
+	SWmin      int              // min index for sliding window
+	msgMap     map[int]*Message // databuffer to store data received from client
+	UnackedMap map[int]*Message //unacked messages
+	WriteMap   map[int]*Message
 }
 
 // NewServer creates, initiates, and returns a new server. This function should
@@ -63,37 +65,41 @@ func NewServer(port int, params *Params) (Server, error) {
 	}
 
 	svr := &server{
-		writeChan:    make(chan *writeMessage),
-		writeMiddleChan: make(chan *writeMessage),
+		writeChan:   make(chan *writeMessage),
 		readChan:    make(chan *Message),
+		readRequest: make(chan int),
 		receiveChan: make(chan *receivedMessage),
 		ClientMap:   make(map[int]*Nclient),
 		clientID:    1,
 		listen:      listen,
 		params:      params,
+		pendingRead: false,
 	}
 
 	go readRoutineServer(svr)
 	go mainRoutineServer(svr)
-	
 	return svr, nil
 }
 
 // read an arbitary (but in order) data received by the server
 func (s *server) Read() (int, []byte, error) {
+	//fmt.Println("server calls Read() function")
+	s.readRequest <- 1
+	//fmt.Println("server sends a 1 into readRequest chan")
 	msg := <-s.readChan
+	//fmt.Println("server finished reading")
 	return msg.ConnID, msg.Payload, nil
 }
 
 // write to the specified connection ID
 func (s *server) Write(connId int, payload []byte) error {
 	data := &writeMessage{
-		connId: connId,
+		connId:  connId,
 		payload: payload,
 	}
-	fmt.Println("send data to WriteChan")
-	s.writeMiddleChan <- data
-	fmt.Println("finish send data to WriteChan")
+
+	s.writeChan <- data
+
 	return nil
 }
 
@@ -109,22 +115,38 @@ func (s *server) Close() error {
 	return nil
 }
 
-
 // handles all incoming or outgoing request for the server
 func mainRoutineServer(svr *server) {
 	for {
 		select {
+		case <-svr.readRequest:
+			//fmt.Println("server trying to read something")
+			read := 0
+			for _, client := range svr.ClientMap {
+				Msg, ok := client.msgMap[client.mapHead]
+				if ok {
+					svr.readChan <- Msg
+					client.mapHead += 1
+					read += 1
+					break
+				}
+			}
+			if read == 0 {
+				svr.pendingRead = true
+			}
 		case sendMsg := <-svr.writeChan: // if we are trying to send
 			cli := svr.ClientMap[sendMsg.connId]
 			checksum := CalculateChecksum(cli.connID, cli.SeqNum, len(sendMsg.payload), sendMsg.payload)
 			msg := NewData(cli.connID, cli.SeqNum, len(sendMsg.payload), sendMsg.payload, checksum)
 			//fmt.Println(sendMsg.SeqNum)
 			cli.WriteMap[msg.SeqNum] = msg
-			cli.SeqNum ++
+			cli.SeqNum++
 			handleWriteServer(svr, cli)
 
 		case Received := <-svr.receiveChan: // if we have received msg from client
+			//fmt.Println("server received something")
 			handleReadServer(svr, Received.payload, Received.addr)
+			//fmt.Println("server read")
 
 		case <-svr.closeChan:
 			svr.listen.Close()
@@ -132,7 +154,7 @@ func mainRoutineServer(svr *server) {
 	}
 }
 
-func handleWriteServer(svr *server, cli *Nclient){
+func handleWriteServer(svr *server, cli *Nclient) {
 	//fmt.Println("enter handleWriteSvr")
 	for {
 		_, ok1 := cli.UnackedMap[cli.SWmin]
@@ -144,21 +166,22 @@ func handleWriteServer(svr *server, cli *Nclient){
 		}
 	}
 	SWmax := cli.SWmin + svr.params.WindowSize - 1
-	for i := cli.SWmin; i <= SWmax; i++{
+	for i := cli.SWmin; i <= SWmax; i++ {
 		sendMsg, ok := cli.WriteMap[i]
 		//fmt.Println(cli.SeqNum)
 		//fmt.Println(cli.SWmin)
-		
-		if ok && len(cli.UnackedMap) < svr.params.MaxUnackedMessages{
+
+		if ok && len(cli.UnackedMap) < svr.params.MaxUnackedMessages {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			svr.listen.WriteToUDP(data, cli.addr)
 			cli.UnackedMap[sendMsg.SeqNum] = sendMsg
-			delete(cli.WriteMap,sendMsg.SeqNum)
-		} 
+			delete(cli.WriteMap, sendMsg.SeqNum)
+		}
 	}
 	//fmt.Println("exit handleWriteSvr")
 }
+
 // when server reads from the UDPConn
 func readRoutineServer(svr *server) {
 	for {
@@ -189,6 +212,7 @@ func readRoutineServer(svr *server) {
 func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 	switch msg.Type {
 	case MsgConnect: // if msg is connect
+		//fmt.Println("server read a connect")
 
 		// ack right away
 		ackMsg := NewAck(svr.clientID, msg.SeqNum)
@@ -198,21 +222,22 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		}
 
 		client := &Nclient{
-			connID:  svr.clientID,
-			addr:    addr,
-			SeqNum:  msg.SeqNum + 1,
-			mapHead: msg.SeqNum + 1,
-			SWmin:  msg.SeqNum + 1,
-			msgMap:  make(map[int]*Message),
+			connID:     svr.clientID,
+			addr:       addr,
+			SeqNum:     msg.SeqNum + 1,
+			mapHead:    msg.SeqNum + 1,
+			SWmin:      msg.SeqNum + 1,
+			msgMap:     make(map[int]*Message),
 			UnackedMap: make(map[int]*Message),
-			WriteMap:    make(map[int]*Message),
+			WriteMap:   make(map[int]*Message),
 		}
 
 		// add new client into map
 		svr.ClientMap[svr.clientID] = client
 		svr.clientID += 1
-
+		//fmt.Println("server finish reading a connect")
 	case MsgData: // if msg is data
+		//fmt.Println("server read a data")
 		if len(msg.Payload) < msg.Size {
 			return
 		}
@@ -223,20 +248,37 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		if err == nil {
 			svr.listen.WriteToUDP(data, svr.ClientMap[ackMsg.ConnID].addr)
 		}
-
 		svr.ClientMap[msg.ConnID].msgMap[msg.SeqNum] = msg
-		for { // if it correspond to the exepcted SN, put the data into readChan
-			tempMsg, ok := svr.ClientMap[msg.ConnID].msgMap[svr.ClientMap[msg.ConnID].mapHead]
+		// if it correspond to the exepcted SN, put the data into readChan
+		for _, client := range svr.ClientMap {
+			tempMsg, ok := client.msgMap[client.mapHead]
 			if ok {
-				fmt.Println("send to readchan")
-				svr.readChan <- tempMsg
-				fmt.Println("finish send to readchan")
-				svr.ClientMap[msg.ConnID].mapHead += 1
-			} else {
-				break
+				//fmt.Println("send to readchan")
+				if svr.pendingRead {
+					svr.readChan <- tempMsg
+					svr.pendingRead = false
+					//fmt.Println("finish send to readchan")
+					client.mapHead += 1
+				}
+
 			}
 		}
+
+		// for _, client := range svr.ClientMap {
+		//  fmt.Printf("For client = ")
+		//  fmt.Println(client)
+		//  fmt.Printf("maphead is %d\n", client.mapHead)
+		//  for key, value := range client.msgMap {
+		//   fmt.Printf("key = ")
+		//   fmt.Println(key)
+		//   fmt.Printf("value = ")
+		//   fmt.Println(value)
+		//  }
+		// }
+		//fmt.Println("server finish reading a data")
+
 	case MsgAck: // if msg is Ack
+		//fmt.Println("server read an Ack")
 		cli := svr.ClientMap[msg.ConnID]
 		ackSeqNum := msg.SeqNum
 		if cli.UnackedMap[ackSeqNum] == nil {
@@ -245,8 +287,10 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 		}
 		delete(cli.UnackedMap, ackSeqNum)
 		handleWriteServer(svr, cli)
+		//fmt.Println("server finished reading Ack")
 		return
 	case MsgCAck: // if msg is CAck
+		//fmt.Println("server read an CAck")
 		cli := svr.ClientMap[msg.ConnID]
 		cackSeqNum := msg.SeqNum
 		for i := 1; i <= cackSeqNum; i++ {
@@ -255,6 +299,7 @@ func handleReadServer(svr *server, msg *Message, addr *lspnet.UDPAddr) {
 			}
 		}
 		handleWriteServer(svr, cli)
+		//fmt.Println("server finished reading an CAck")
 		return
 	}
 

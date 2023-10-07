@@ -9,11 +9,12 @@ import (
 )
 
 type client struct {
-	connId      int              // The connection id given by the server
-	receiveChan chan *Message    // intake anything sent to the client by the server
-	readChan    chan []byte      // channel for Read()
-	writeChan    chan []byte    // channel for msg send to server
-	closeChan   chan int         // channel for signalling close
+	connId      int           // The connection id given by the server
+	receiveChan chan *Message // intake anything sent to the client by the server
+	readChan    chan *Message // channel for Read()
+	writeChan   chan []byte   // channel for msg send to server
+	closeChan   chan int      // channel for signalling close
+	readRequest chan int
 	conn        *lspnet.UDPConn  // UDP connection
 	SeqNum      int              // client side SN
 	mapHead     int              // the SN we are looking for next
@@ -22,6 +23,7 @@ type client struct {
 	UnackedMap  map[int]*Message // map for storing unacked messages
 	WriteMap    map[int]*Message
 	params      *Params
+	pendingRead bool
 }
 
 // NewClient creates, initiates, and returns a new client. This function
@@ -38,7 +40,7 @@ type client struct {
 // hostport is a colon-separated string identifying the server's host address
 // and port number (i.e., "localhost:9999").
 func NewClient(hostport string, initialSeqNum int, params *Params) (Client, error) {
-	
+
 	udpAddr, err := lspnet.ResolveUDPAddr("udp", hostport)
 	if err != nil {
 		return nil, err
@@ -73,9 +75,10 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 	cli := &client{
 		connId:      msg.ConnID, // use the returned connectionID to construct new client instance
 		receiveChan: make(chan *Message),
-		writeChan:    make(chan []byte),
-		readChan:    make(chan []byte),
+		writeChan:   make(chan []byte),
+		readChan:    make(chan *Message),
 		closeChan:   make(chan int),
+		readRequest: make(chan int),
 		conn:        udpConn,
 		SeqNum:      initialSeqNum + 1,
 		mapHead:     initialSeqNum + 1,
@@ -84,6 +87,7 @@ func NewClient(hostport string, initialSeqNum int, params *Params) (Client, erro
 		UnackedMap:  make(map[int]*Message),
 		WriteMap:    make(map[int]*Message),
 		params:      params,
+		pendingRead: false,
 	}
 
 	go readRoutine(cli)
@@ -99,13 +103,16 @@ func (c *client) ConnID() int {
 
 // Read() takes the elem from readChan directory (possibly wait indefinitely)
 func (c *client) Read() ([]byte, error) {
-	data := <-c.readChan
-	return data, nil
+	c.readRequest <- 1
+	//fmt.Println("server sends a 1 into readRequest chan")
+	msg := <-c.readChan
+	//fmt.Println("server finished reading")
+	return msg.Payload, nil
 }
 
 // Write() generates the new data msg and put into sendChan
 func (c *client) Write(payload []byte) error {
-	
+
 	c.writeChan <- payload
 
 	return nil
@@ -139,6 +146,21 @@ func readRoutine(cli *client) {
 func mainRoutine(cli *client) {
 	for {
 		select {
+		case <-cli.readRequest:
+			//fmt.Println("server trying to read something")
+			read := 0
+
+			Msg, ok := cli.MsgMap[cli.mapHead]
+			if ok {
+				cli.readChan <- Msg
+				cli.mapHead += 1
+				read += 1
+				break
+			}
+
+			if read == 0 {
+				cli.pendingRead = true
+			}
 		case msg := <-cli.receiveChan: // if we received anything from server
 			handleRead(cli, msg)
 
@@ -147,7 +169,7 @@ func mainRoutine(cli *client) {
 			sendMsg := NewData(cli.connId, cli.SeqNum, len(payload), payload, checksum)
 			//fmt.Println(sendMsg.SeqNum)
 			cli.WriteMap[sendMsg.SeqNum] = sendMsg
-			cli.SeqNum ++
+			cli.SeqNum++
 			handleWrite(cli)
 
 		case <-cli.closeChan:
@@ -158,7 +180,7 @@ func mainRoutine(cli *client) {
 }
 
 func handleWrite(cli *client) {
-	
+
 	for {
 		_, ok1 := cli.UnackedMap[cli.SWmin]
 		_, ok2 := cli.WriteMap[cli.SWmin]
@@ -169,27 +191,29 @@ func handleWrite(cli *client) {
 		}
 	}
 	SWmax := cli.SWmin + cli.params.WindowSize - 1
-	for i := cli.SWmin; i <= SWmax; i++{
+	for i := cli.SWmin; i <= SWmax; i++ {
 		sendMsg, ok := cli.WriteMap[i]
 		//fmt.Println(cli.SeqNum)
 		//fmt.Println(cli.SWmin)
-		
-		if ok && len(cli.UnackedMap) < cli.params.MaxUnackedMessages{
+
+		if ok && len(cli.UnackedMap) < cli.params.MaxUnackedMessages {
 			data, _ := json.Marshal(sendMsg)
 			//fmt.Println(sendMsg)
 			cli.conn.Write(data)
 			cli.UnackedMap[sendMsg.SeqNum] = sendMsg
-			delete(cli.WriteMap,sendMsg.SeqNum)
-		} 
+			delete(cli.WriteMap, sendMsg.SeqNum)
+		}
 	}
-	
-	
 
 }
+
 // helper function called in mainRoutine to handle specific incoming msg packet
 func handleRead(cli *client, msg *Message) {
 	switch msg.Type {
 	case MsgData: // if msg is data
+		if len(msg.Payload) < msg.Size {
+			return
+		}
 		ackMsg := NewAck(cli.connId, msg.SeqNum)
 		data, err := json.Marshal(ackMsg)
 		if err == nil {
@@ -197,14 +221,16 @@ func handleRead(cli *client, msg *Message) {
 		}
 
 		cli.MsgMap[msg.SeqNum] = msg
-		for {
-			tempMsg, ok := cli.MsgMap[cli.mapHead]
-			if ok {
-				cli.readChan <- tempMsg.Payload
+		tempMsg, ok := cli.MsgMap[cli.mapHead]
+		if ok {
+			//fmt.Println("send to readchan")
+			if cli.pendingRead {
+				cli.readChan <- tempMsg
+				cli.pendingRead = false
+				//fmt.Println("finish send to readchan")
 				cli.mapHead += 1
-			} else {
-				break
 			}
+
 		}
 
 	case MsgAck: // if msg is Ack
